@@ -341,6 +341,7 @@ struct e1000_adapter {
 	bool burst_mode;                   /* true = burst mode, false = random drop mode */
 	u64 burst_drop_count;              /* packets dropped during burst windows */
 	u64 burst_pass_count;              /* packets passed during pause windows */
+	u32 throttle_consecutive_drops;    /* avoid long starvation during random drop */
 	struct proc_dir_entry *throttler_proc;
 };
 

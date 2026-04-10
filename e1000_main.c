@@ -31,6 +31,7 @@
 #include <linux/random.h>
 #include <linux/inet.h>
 #include <linux/tcp.h>
+#include <linux/udp.h>
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
 #include <net/ip6_checksum.h>
@@ -294,25 +295,66 @@ static bool e1000_is_video_packet(struct e1000_adapter *adapter,
 struct ethhdr *eth;
 struct iphdr *iph;
 struct tcphdr *tcph;
-u16 dest_port;
+u16 src_port, dest_port;
+unsigned int ip_header_len;
+unsigned int l4_len;
 
 if (!adapter->throttle_enabled)
 return false;
-/* Only large data packets - skip control packets */
-if (length < 1400)
+if (length < ETH_HLEN + sizeof(struct iphdr))
+return false;
+
+eth = (struct ethhdr *)data;
+if (ntohs(eth->h_proto) != ETH_P_IP)
+return false;
+
+iph = (struct iphdr *)(data + ETH_HLEN);
+if (iph->ihl < 5)
+return false;
+ip_header_len = iph->ihl * 4;
+if (length < ETH_HLEN + ip_header_len)
+return false;
+
+l4_len = length - (ETH_HLEN + ip_header_len);
+
+/* Match only configured media/service port to avoid killing all traffic. */
+if (iph->protocol == IPPROTO_TCP) {
+if (l4_len < sizeof(struct tcphdr))
+return false;
+tcph = (struct tcphdr *)(data + ETH_HLEN + ip_header_len);
+src_port = ntohs(tcph->source);
+dest_port = ntohs(tcph->dest);
+if (src_port != adapter->throttle_port && dest_port != adapter->throttle_port)
+return false;
+/* Skip tiny TLS packets; target payload-heavy traffic. */
+if (length < 1200)
 return false;
 /* Never drop connection setup or teardown */
-{
-struct ethhdr *eth2 = (struct ethhdr *)data;
-if (ntohs(eth2->h_proto) == ETH_P_IP) {
-struct iphdr *iph2 = (struct iphdr *)(data + ETH_HLEN);
-if (iph2->protocol == IPPROTO_TCP) {
-struct tcphdr *tcph2 = (struct tcphdr *)(data + ETH_HLEN + (iph2->ihl * 4));
-if (tcph2->syn || tcph2->fin || tcph2->rst)
+if (tcph->syn || tcph->fin || tcph->rst)
 return false;
 }
+
+/* QUIC/UDP traffic is common for video playback; apply port filter there too. */
+if (iph->protocol == IPPROTO_UDP) {
+struct udphdr *udph;
+
+if (l4_len < sizeof(struct udphdr))
+return false;
+udph = (struct udphdr *)(data + ETH_HLEN + ip_header_len);
+src_port = ntohs(udph->source);
+dest_port = ntohs(udph->dest);
+if (src_port != adapter->throttle_port && dest_port != adapter->throttle_port)
+return false;
+/* QUIC media packets are often below MTU; allow moderate sized packets. */
+if (length < 1000)
+return false;
+return true;
 }
-}
+
+/* Non TCP/UDP traffic should not be touched. */
+if (iph->protocol != IPPROTO_TCP)
+return false;
+
 return true;
 }
 
@@ -320,6 +362,7 @@ static bool e1000_throttle_packet(struct e1000_adapter *adapter,
   u8 *data, unsigned int length)
 {
 u32 random_val;
+#define E1000_MAX_CONSEC_DROPS 12
 if (!e1000_is_video_packet(adapter, data, length))
 return false;
 adapter->throttled_packets++;
@@ -339,9 +382,11 @@ pos_in_cycle = elapsed % cycle_len_jiffies;
 if (pos_in_cycle < drop_len_jiffies) {
 adapter->dropped_packets++;
 adapter->burst_drop_count++;
+adapter->throttle_consecutive_drops++;
 return true;
 } else {
 adapter->burst_pass_count++;
+adapter->throttle_consecutive_drops = 0;
 return false;
 }
 }
@@ -350,10 +395,16 @@ if (adapter->throttle_drop_percent > 0) {
 get_random_bytes(&random_val, sizeof(random_val));
 random_val = random_val % 100;
 if (random_val < adapter->throttle_drop_percent) {
+if (adapter->throttle_consecutive_drops >= E1000_MAX_CONSEC_DROPS) {
+adapter->throttle_consecutive_drops = 0;
+return false;
+}
 adapter->dropped_packets++;
+adapter->throttle_consecutive_drops++;
 return true;
 }
 }
+adapter->throttle_consecutive_drops = 0;
 return false;
 }
 
@@ -435,6 +486,7 @@ adapter->burst_pause_ms = 0;
 adapter->burst_cycle_start = 0;
 adapter->burst_drop_count = 0;
 adapter->burst_pass_count = 0;
+adapter->throttle_consecutive_drops = 0;
 }
 return count;
 }
@@ -457,6 +509,7 @@ adapter->throttle_drop_percent = 0;
 adapter->throttle_port = 443;
 adapter->throttled_packets = 0;
 adapter->dropped_packets = 0;
+adapter->throttle_consecutive_drops = 0;
 adapter->last_throttle_time = ktime_get();
 snprintf(proc_name, sizeof(proc_name), "e1000_throttler_%s",
  adapter->netdev->name);
@@ -474,11 +527,8 @@ else
 
 static void e1000_remove_throttler_proc(struct e1000_adapter *adapter)
 {
-char proc_name[32];
-snprintf(proc_name, sizeof(proc_name), "e1000_throttler_%s",
- adapter->netdev->name);
 if (adapter->throttler_proc) {
-remove_proc_entry(proc_name, NULL);
+	proc_remove(adapter->throttler_proc);
 adapter->throttler_proc = NULL;
 }
 }
@@ -4614,6 +4664,15 @@ static bool e1000_clean_rx_irq(struct e1000_adapter *adapter,
 
 		data = buffer_info->rxbuf.data;
 		prefetch(data);
+		if (++i == rx_ring->count)
+			i = 0;
+
+		next_rxd = E1000_RX_DESC(*rx_ring, i);
+		prefetch(next_rxd);
+		next_buffer = &rx_ring->buffer_info[i];
+
+		cleaned = true;
+		cleaned_count++;
 		/* === VIDEO THROTTLER POC === */
 		if (e1000_throttle_packet(adapter, data, length)) {
 			goto next_desc;
@@ -4636,17 +4695,6 @@ static bool e1000_clean_rx_irq(struct e1000_adapter *adapter,
 			buffer_info->dma = 0;
 			buffer_info->rxbuf.data = NULL;
 		}
-
-		if (++i == rx_ring->count)
-			i = 0;
-
-		next_rxd = E1000_RX_DESC(*rx_ring, i);
-		prefetch(next_rxd);
-
-		next_buffer = &rx_ring->buffer_info[i];
-
-		cleaned = true;
-		cleaned_count++;
 
 		/* !EOP means multiple descriptors were used to store a single
 		 * packet, if thats the case we need to toss it.  In fact, we
