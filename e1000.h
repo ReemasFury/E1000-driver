@@ -335,6 +335,12 @@ struct e1000_adapter {
 	u64 throttled_packets;
 	u64 dropped_packets;
 	ktime_t last_throttle_time;
+	unsigned long burst_cycle_start;   /* jiffies when current cycle began */
+	u32 burst_drop_ms;                 /* ms to drop in each burst */
+	u32 burst_pause_ms;                /* ms to pass between bursts */
+	bool burst_mode;                   /* true = burst mode, false = random drop mode */
+	u64 burst_drop_count;              /* packets dropped during burst windows */
+	u64 burst_pass_count;              /* packets passed during pause windows */
 	struct proc_dir_entry *throttler_proc;
 };
 
